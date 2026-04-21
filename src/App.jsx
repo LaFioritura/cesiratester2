@@ -746,6 +746,7 @@ export default function App(){
   const undoStack=useRef([]);
   const [undoLen,setUndoLen]=useState(0);
   const [vizData,setVizData]=useState(new Uint8Array(64));
+  const transportBarRef=useRef(0);
 
   // ── Active notes display
   const [activeNotes,setActiveNotes]=useState({bass:'—',synth:'—'});
@@ -805,6 +806,8 @@ export default function App(){
     a.dry.gain.linearRampToValueAtTime(clamp(0.95-space*0.08,0.72,0.97),now+0.08);
     a.chorus.gain.linearRampToValueAtTime(clamp(space*0.08,0,0.14),now+0.12);
     a.revW.gain.linearRampToValueAtTime(clamp(fx.space*space*0.22,0,0.28),now+0.14);
+    a.comp.attack.value=clamp(0.006+compress*0.012,0.004,0.03);
+    a.comp.release.value=clamp(0.16+space*0.2+compress*0.12,0.12,0.42);
     a.out.gain.linearRampToValueAtTime(master,now+0.06);
     a.comp.threshold.value=clamp(-20-compress*12,-32,-6);
     a.comp.ratio.value=clamp(2+compress*5,1.5,8);
@@ -846,24 +849,81 @@ export default function App(){
   };
 
   const stepSec=()=>(60/bpmRef.current)/4;
+  const laneHash=(lane,step,bar=0,extra=0)=>{
+    const base=(lane.charCodeAt(0)*131+lane.length*17+step*37+bar*53+extra*97)%997;
+    return (Math.sin(base*12.9898)*43758.5453)%1;
+  };
+  const humanizeEvent=(lane,step,bar,accent=1)=>{
+    const laneScale=lane==='hat'?1.35:lane==='snare'?1.1:lane==='kick'?0.72:lane==='bass'?0.95:0.9;
+    const jitter=((laneHash(lane,step,bar,1)+laneHash(lane,step,bar,2))*0.5-0.5)*humanizeRef.current*0.03*laneScale;
+    const velShape=1+((laneHash(lane,step,bar,3)-0.5)*0.22*laneScale);
+    const toneShift=(laneHash(lane,step,bar,4)-0.5)*0.22;
+    const decayShift=(laneHash(lane,step,bar,5)-0.5)*0.18;
+    return {
+      jitter,
+      accent:clamp(accent*velShape,0.08,1.18),
+      toneShift,
+      decayShift,
+      variant:laneHash(lane,step,bar,6)>0.5?1:0,
+    };
+  };
+  const drumRuntimeVariation=(lane,step,bar)=>{
+    const pos=step%16;
+    const every2=bar%2===1;
+    const every4=bar%4===3;
+    const every8=bar%8===7;
+    const out={extra:false,ghost:false,accentMul:1,openBias:0,variantBias:0};
+    if(lane==='hat'){
+      if(every2&&(pos===7||pos===15))out.accentMul=1.08;
+      if(every4&&(pos===11||pos===13))out.extra=true;
+      if(every8&&pos>=12)out.openBias=0.08+(pos-12)*0.025;
+      if((bar+pos)%3===0)out.variantBias=0.18;
+    } else if(lane==='snare'){
+      if(every2&&(pos===4||pos===12))out.ghost=true;
+      if(every4&&pos===15)out.extra=true;
+      if(every8&&(pos===14||pos===15))out.accentMul=1.12;
+      if(pos===12)out.variantBias=0.22;
+    } else if(lane==='kick'){
+      if(every2&&(pos===0||pos===8))out.accentMul=1.05;
+      if(every4&&pos===14)out.extra=true;
+      if(every8&&pos>=12)out.accentMul=1.08;
+      if(pos===0||pos===14)out.variantBias=0.16;
+    }
+    return out;
+  };
+  const duckMixFromKick=(accent,t)=>{
+    const bassGain=laneGains.current.bass;
+    const synthGain=laneGains.current.synth;
+    const duckAmt=clamp(0.84-(accent*0.12+compress*0.05),0.66,0.9);
+    [bassGain,synthGain].forEach((g,idx)=>{
+      if(!g)return;
+      const release=idx===0?0.12:0.18;
+      try{
+        g.gain.cancelScheduledValues(t);
+        g.gain.setValueAtTime(g.gain.value||1,t);
+        g.gain.linearRampToValueAtTime(duckAmt,t+0.008);
+        g.gain.exponentialRampToValueAtTime(0.999,t+release);
+      }catch{}
+    });
+  };
 
   // ─── DRUM SYNTHESIS ────────────────────────────────────────────────────────
-  const playKick=(accent,t)=>{
+  const playKick=(accent,t,variation={})=>{
     if(!nodeGuard())return;
     const a=audioRef.current;const gd=GENRES[genre];
-    const kickTone=drumPresetCfg.kickTone??0.6;
+    const kickTone=clamp((drumPresetCfg.kickTone??0.6)+(variation.toneShift||0)+(variation.variantBias||0),0.2,1);
     const kf=gd.kickFreq||90,ke=gd.kickEnd||35;
     const startFreq=clamp(kf*(0.92+kickTone*0.4),45,140);
     const endFreq=clamp(ke*(0.8+kickTone*0.45),20,70);
-    const et=0.06+drumDecay*0.14+(1-kickTone)*0.03,dt=0.13+drumDecay*0.24+(1-kickTone)*0.04;
+    const et=0.06+drumDecay*0.14+(1-kickTone)*0.03+Math.max(-0.015,(variation.decayShift||0)*0.03),dt=0.13+drumDecay*0.24+(1-kickTone)*0.04+Math.max(-0.03,(variation.decayShift||0)*0.05);
     const body=a.ctx.createOscillator(),bG=a.ctx.createGain();
     const punch=a.ctx.createOscillator(),pG=a.ctx.createGain();
     const sub=a.ctx.createOscillator(),sG=a.ctx.createGain();
     const click=a.ctx.createBufferSource(),cG=a.ctx.createGain();
     const mG=a.ctx.createGain(),sh=a.ctx.createWaveShaper(),bodyF=a.ctx.createBiquadFilter();
-    body.type=kickTone>0.72?'triangle':'sine';
+    body.type=(variation.variant? (kickTone>0.68?'triangle':'sine') : (kickTone>0.8?'triangle':'sine'));
     body.frequency.setValueAtTime(startFreq,t);body.frequency.exponentialRampToValueAtTime(Math.max(20,endFreq),t+et);
-    punch.type=kickTone>0.66?'square':'triangle';
+    punch.type=variation.variant?(kickTone>0.56?'square':'triangle'):(kickTone>0.72?'square':'triangle');
     punch.frequency.setValueAtTime(startFreq*1.9,t);punch.frequency.exponentialRampToValueAtTime(Math.max(30,endFreq*1.4),t+Math.max(0.018,et*0.45));
     sub.type='sine';sub.frequency.setValueAtTime(startFreq*0.5,t);sub.frequency.exponentialRampToValueAtTime(Math.max(18,endFreq*0.5),t+et*1.05);
     const cb=a.ctx.createBuffer(1,Math.floor(a.ctx.sampleRate*0.0045),a.ctx.sampleRate);
@@ -876,36 +936,37 @@ export default function App(){
     body.connect(bodyF);bodyF.connect(sh);sh.connect(bG);punch.connect(pG);sub.connect(sG);click.connect(cG);
     bG.connect(mG);pG.connect(mG);sG.connect(mG);cG.connect(mG);
     const dest=getLaneGain('kick')||a.bus;mG.connect(dest);
+    duckMixFromKick(accent,t);
     const dur=(dt+0.12)*1000+220;trackNode(dur);
     gc(body,[bodyF,punch,sub,click,bG,pG,sG,cG,mG,sh],dur);
     ss(body,t);ss(punch,t);ss(sub,t);ss(click,t);st(body,t+dt+0.06);st(punch,t+dt*0.4+0.03);st(sub,t+dt+0.1);st(click,t+0.01);
   };
 
-  const playSnare=(accent,t)=>{
+  const playSnare=(accent,t,variation={})=>{
     if(!nodeGuard())return;
     const a=audioRef.current;const gd=GENRES[genre];
-    const snareTone=drumPresetCfg.snareTone??0.6;
-    const nb=noiseBuffer(0.16+drumDecay*0.08,0.18+noiseMix*0.46,gd.noiseColor||'white');
+    const snareTone=clamp((drumPresetCfg.snareTone??0.6)+(variation.toneShift||0)+(variation.variantBias||0),0.18,1);
+    const nb=noiseBuffer(0.16+drumDecay*0.08+Math.max(-0.03,(variation.decayShift||0)*0.04),0.18+noiseMix*0.46+(variation.ghost?0.03:0),gd.noiseColor||'white');
     const src=a.ctx.createBufferSource(),fil=a.ctx.createBiquadFilter(),bp=a.ctx.createBiquadFilter(),g=a.ctx.createGain();
     const osc=a.ctx.createOscillator(),og=a.ctx.createGain();
-    src.buffer=nb;fil.type='bandpass';fil.frequency.value=1200+snareTone*1400+noiseMix*300;fil.Q.value=0.8+compress*0.5;
+    src.buffer=nb;fil.type='bandpass';fil.frequency.value=1200+snareTone*1400+noiseMix*300;fil.Q.value=0.8+compress*0.5+(variation.variant?0.25:0);
     bp.type='highpass';bp.frequency.value=clamp(180+snareTone*260,120,520);
     osc.type=snareTone>0.64?'triangle':'sine';osc.frequency.value=clamp(150+snareTone*110,140,320);
-    og.gain.setValueAtTime(0,t);og.gain.linearRampToValueAtTime((0.08+snareTone*0.18)*accent,t+0.001);og.gain.exponentialRampToValueAtTime(0.001,t+0.045+drumDecay*0.08);
-    g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime((0.38+snareTone*0.22)*accent,t+0.002);g.gain.exponentialRampToValueAtTime(0.001,t+0.05+drumDecay*0.13);
+    og.gain.setValueAtTime(0,t);og.gain.linearRampToValueAtTime((0.06+snareTone*0.2)*(variation.ghost?0.55:1)*accent,t+0.001);og.gain.exponentialRampToValueAtTime(0.001,t+0.045+drumDecay*0.08);
+    g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime((0.34+snareTone*0.24)*(variation.ghost?0.52:1)*accent,t+0.002);g.gain.exponentialRampToValueAtTime(0.001,t+0.05+drumDecay*0.13);
     src.connect(fil);fil.connect(bp);bp.connect(g);osc.connect(og);og.connect(g);
     const dest=getLaneGain('snare')||a.bus;g.connect(dest);
     gc(src,[fil,bp,g,osc,og],500);ss(src,t);ss(osc,t);st(src,t+0.2);st(osc,t+0.08+drumDecay*0.06);
   };
 
-  const playHat=(accent,t,open=false)=>{
+  const playHat=(accent,t,open=false,variation={})=>{
     if(!nodeGuard())return;
     const a=audioRef.current;const gd=GENRES[genre];
-    const hatTone=drumPresetCfg.hatTone??0.8;
-    const nb=noiseBuffer(open?0.26+drumDecay*0.08:0.08+drumDecay*0.04,0.14+noiseMix*0.32,gd.noiseColor||'white');
+    const hatTone=clamp((drumPresetCfg.hatTone??0.8)+(variation.toneShift||0)+(variation.variantBias||0),0.22,1);
+    const nb=noiseBuffer(open?0.26+drumDecay*0.08+Math.max(-0.02,(variation.decayShift||0)*0.04):0.08+drumDecay*0.04+Math.max(-0.01,(variation.decayShift||0)*0.015),0.14+noiseMix*0.32+(variation.variant?0.02:0),gd.noiseColor||'white');
     const src=a.ctx.createBufferSource(),hp=a.ctx.createBiquadFilter(),bp=a.ctx.createBiquadFilter(),g=a.ctx.createGain();
     src.buffer=nb;hp.type='highpass';hp.frequency.value=open?clamp(5200+hatTone*2200,4200,9200):clamp(6800+hatTone*2400,5800,12000);
-    bp.type='bandpass';bp.frequency.value=open?clamp(7600+hatTone*2600,6200,12000):clamp(9000+hatTone*2200,7600,14000);bp.Q.value=open?0.9:1.4;
+    bp.type='bandpass';bp.frequency.value=open?clamp(7600+hatTone*2600+(variation.variant?260:-120),6200,12000):clamp(9000+hatTone*2200+(variation.variant?-320:180),7600,14000);bp.Q.value=open?(variation.variant?0.75:0.9):(variation.variant?1.1:1.4);
     const decay=open?0.05+drumDecay*0.22+hatTone*0.02:0.006+drumDecay*0.032+(1-hatTone)*0.01;
     g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime((0.18+hatTone*0.18)*accent,t+0.0009);g.gain.exponentialRampToValueAtTime(0.001,t+decay);
     src.connect(hp);hp.connect(bp);bp.connect(g);const dest=getLaneGain('hat')||a.bus;g.connect(dest);
@@ -1107,23 +1168,38 @@ export default function App(){
   // ─── SCHEDULER ────────────────────────────────────────────────────────────
   const scheduleNote=(si,t)=>{
     const lp=patternsRef.current,ll=laneLenRef.current;
+    if(si%16===0)transportBarRef.current+=1;
+    const transportBar=transportBarRef.current;
     const accent=si%4===0?1:0.85;
     for(const lane of['kick','snare','hat','bass','synth']){
       const len=ll[lane]||16;
       const li=si%len;
       const sd=lp[lane][li];
-      if(!sd||!sd.on)continue;
-      if(sd.tied)continue; // skip tied (held) steps — note is already sounding
-      if(sd.p<1&&rnd()>sd.p)continue;
-      const jit=(rnd()-0.5)*humanizeRef.current*0.02;
-      const noteT=t+Math.max(0,jit);
+      const runtimeVar=lane==='kick'||lane==='snare'||lane==='hat'?drumRuntimeVariation(lane,si,transportBar):null;
+      const shouldGhost=lane==='snare' && runtimeVar?.ghost && !sd?.on;
+      const shouldExtra=runtimeVar?.extra && (lane==='hat'||lane==='snare'||lane==='kick');
+      if((!sd||!sd.on) && !shouldGhost && !shouldExtra)continue;
+      if(sd?.tied)continue;
+      if(sd?.p<1&&rnd()>sd.p && !shouldGhost && !shouldExtra)continue;
       const ga=grooveAccent(grooveProfileRef.current,lane,li,grooveRef.current);
-      const fa=clamp(accent*ga*(sd.v||1),0.1,1.15);
-      if(lane==='kick')playKick(fa,noteT);
-      else if(lane==='snare')playSnare(fa,noteT);
-      else if(lane==='hat')playHat(fa,noteT,si%32===0&&rnd()<(drumPresetCfg.hatOpenChance??0.12));
-      else if(lane==='bass')playBass(bassRef.current[li]||'C2',fa,noteT,sd.l||1);
-      else if(lane==='synth')playSynth(synthRef.current[li]||'C4',fa,noteT,sd.l||1);
+      const baseAccent=clamp(accent*ga*((sd?.v)||1)*(runtimeVar?.accentMul||1),0.08,1.15);
+      const hum=humanizeEvent(lane,si,transportBar,baseAccent);
+      const noteT=t+Math.max(0,hum.jitter);
+      const fa=hum.accent;
+      if(lane==='kick'){
+        if(sd?.on || shouldExtra)playKick(shouldExtra&&!sd?.on?fa*0.72:fa,noteT,{...hum,...runtimeVar,variant:hum.variant||((runtimeVar?.variantBias||0)>0.16?1:0)});
+      }
+      else if(lane==='snare'){
+        if(sd?.on || shouldGhost || shouldExtra)playSnare(shouldGhost&&!sd?.on?fa*0.62:(shouldExtra&&!sd?.on?fa*0.78:fa),noteT,{...hum,...runtimeVar,ghost:shouldGhost&&!sd?.on,variant:hum.variant||((runtimeVar?.variantBias||0)>0.18?1:0)});
+      }
+      else if(lane==='hat'){
+        const openBase=(li%16===7||li%16===15||si%32===0);
+        const openChance=clamp((drumPresetCfg.hatOpenChance??0.12)+(runtimeVar?.openBias||0),0.04,0.42);
+        const isOpen=openBase&&rnd()<openChance;
+        if(sd?.on || shouldExtra)playHat(shouldExtra&&!sd?.on?fa*0.7:fa,noteT,isOpen,{...hum,...runtimeVar,variant:hum.variant||((runtimeVar?.variantBias||0)>0.14?1:0)});
+      }
+      else if(lane==='bass')playBass(bassRef.current[li]||'C2',fa,noteT,sd?.l||1);
+      else if(lane==='synth')playSynth(synthRef.current[li]||'C4',fa,noteT,sd?.l||1);
       const delay=Math.max(0,(noteT-audioRef.current.ctx.currentTime)*1000);
       setTimeout(()=>flashLane(lane,fa),delay);
     }
@@ -1169,7 +1245,7 @@ export default function App(){
   const startClock=()=>{
     const a=audioRef.current;if(!a)return;
     nextNoteRef.current=a.ctx.currentTime+0.06;
-    stepRef.current=0;isPlayingRef.current=true;
+    stepRef.current=0;transportBarRef.current=0;isPlayingRef.current=true;
     schedulerRef.current=setInterval(runScheduler,LOOK);
   };
   const stopClock=()=>{
