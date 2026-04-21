@@ -21,6 +21,18 @@ const SOUND_CHARACTERS={
 const CHARACTER_BY_GENRE={techno:'tight',house:'warm',ambient:'bright',dnb:'dirty',acid:'dirty',industrial:'dark',experimental:'bright',cinematic:'warm'};
 const getGenreSoundCharacter=genre=>CHARACTER_BY_GENRE[genre]||pick(Object.keys(SOUND_CHARACTERS));
 
+const GENRE_FAMILY_PROFILES={
+  techno:{drive:0.08,tone:-0.04,space:-0.03,motion:0.05,accent:0.05,hookBias:0.72,fillBias:'impact',bassRole:'pulse',synthRole:'stab'},
+  house:{drive:-0.01,tone:0.08,space:0.06,motion:0.03,accent:0.02,hookBias:0.64,fillBias:'lift',bassRole:'round',synthRole:'chord'},
+  ambient:{drive:-0.06,tone:0.12,space:0.14,motion:0.02,accent:-0.02,hookBias:0.4,fillBias:'air',bassRole:'drone',synthRole:'wash'},
+  dnb:{drive:0.1,tone:0.0,space:-0.02,motion:0.08,accent:0.06,hookBias:0.78,fillBias:'break',bassRole:'pressure',synthRole:'stab'},
+  acid:{drive:0.14,tone:-0.03,space:-0.02,motion:0.1,accent:0.05,hookBias:0.82,fillBias:'squelch',bassRole:'lead',synthRole:'answer'},
+  industrial:{drive:0.18,tone:-0.08,space:-0.05,motion:0.07,accent:0.08,hookBias:0.58,fillBias:'impact',bassRole:'weight',synthRole:'shard'},
+  experimental:{drive:0.05,tone:0.03,space:0.07,motion:0.14,accent:0.03,hookBias:0.52,fillBias:'glitch',bassRole:'shape',synthRole:'gesture'},
+  cinematic:{drive:-0.03,tone:0.1,space:0.12,motion:0.04,accent:0.01,hookBias:0.56,fillBias:'swell',bassRole:'pedal',synthRole:'theme'},
+};
+const getGenreFamilyProfile=genre=>GENRE_FAMILY_PROFILES[genre]||GENRE_FAMILY_PROFILES.techno;
+
 // ─── GENRE DNA ────────────────────────────────────────────────────────────────
 const GENRES={
   techno:{bpm:[128,140],kick:'every4',swing:0.02,atmosphere:'dark industrial',
@@ -240,6 +252,68 @@ function createStructuredBarProfile(sectionName,totalBars,visitCount,cycleIndex,
   });
 }
 
+
+function mergeCharacterAndGenre(name, genre){
+  const charCfg=getCharacterConfig(name);
+  const fam=getGenreFamilyProfile(genre);
+  return{
+    ...charCfg,
+    toneBias:charCfg.toneBias+fam.tone,
+    spaceBias:charCfg.spaceBias+fam.space,
+    driveBias:charCfg.driveBias+fam.drive,
+    accentBias:charCfg.accentBias+fam.accent,
+    motionBias:charCfg.motionBias+fam.motion,
+  };
+}
+
+function scoreHook(notes,pool,lane,sectionName){
+  const seq=(notes||[]).filter(Boolean);
+  if(seq.length<3)return 0;
+  const uniq=new Set(seq).size;
+  const motion=seq.slice(1).reduce((acc,n,i)=>acc+Math.abs((pool.indexOf(n)??0)-(pool.indexOf(seq[i])??0)),0);
+  const repeated=Math.max(0,seq.length-uniq);
+  const contourBonus=seq[0]===seq[seq.length-1]?0.35:0;
+  const laneBias=lane==='synth'?0.28:0.18;
+  const sectionBias=sectionName==='drop'||sectionName==='groove'?0.22:sectionName==='build'?0.12:0;
+  return repeated*0.24 + motion*0.04 + contourBonus + laneBias + sectionBias;
+}
+
+function extractHookCandidates(line, active, lane, pool, sectionName){
+  const candidates=[];
+  for(let start=0; start<=Math.min(line.length-4,16); start+=2){
+    const slice=line.slice(start,start+6).filter(Boolean);
+    const activeCount=(active||[]).slice(start,start+6).filter(Boolean).length;
+    if(slice.length>=3 && activeCount>=2){
+      candidates.push({
+        notes:slice.slice(0,4),
+        score:scoreHook(slice,pool,lane,sectionName)+activeCount*0.08-(start*0.01),
+      });
+    }
+  }
+  return candidates.sort((a,b)=>b.score-a.score).slice(0,2);
+}
+
+function getHookRecallWeight(sectionName, genre){
+  const fam=getGenreFamilyProfile(genre);
+  const sectionBias={intro:0.08,build:0.42,drop:0.88,groove:0.76,break:0.24,tension:0.54,outro:0.18,fill:0.34};
+  return clamp((sectionBias[sectionName]??0.4)*fam.hookBias,0.06,0.92);
+}
+
+function chooseTransitionFillMode(sectionName,memory,genre){
+  const recent=memory?.recentSections||[];
+  const prev=recent[recent.length-1]||null;
+  const fam=getGenreFamilyProfile(genre);
+  if(sectionName==='fill'){
+    if(prev==='break')return 're-entry';
+    if(prev==='build'||prev==='tension')return fam.fillBias==='break'?'break-rush':'lift';
+    if(prev==='drop'||prev==='groove')return fam.fillBias==='air'?'air-gap':'roll';
+    return fam.fillBias||'impact';
+  }
+  if(sectionName==='drop'&&(prev==='break'||prev==='build'||prev==='tension'))return 'release';
+  if(sectionName==='break'&&(prev==='drop'||prev==='groove'))return 'strip';
+  return 'neutral';
+}
+
 function createCompositionBlueprint(genre, modeName, progression, arpeMode){
   const contour=[0];
   for(let i=1;i<8;i++){
@@ -262,10 +336,12 @@ function createCompositionBlueprint(genre, modeName, progression, arpeMode){
   };
   const hookShift=pick([-2,-1,1,2]);
   const soundCharacter=getGenreSoundCharacter(genre);
+  const genreFamily=getGenreFamilyProfile(genre);
   return{
     id:`${genre}-${modeName}-${Date.now()}-${Math.floor(rnd()*9999)}`,
     genre,modeName,arpeMode,progression,
     soundCharacter,
+    genreFamily,
     macroEnergyCurve:pick([[0.92,1.02,0.96,1.08],[0.9,0.98,1.04,1.1],[0.88,1.0,0.95,1.12]]),
     contour,
     bassRhythm:pick(rhythmicSets.bass).slice(),
@@ -281,8 +357,12 @@ function createCompositionBlueprint(genre, modeName, progression, arpeMode){
       previousSynthTail:null,
       sectionVisits:{},
       recentSections:[],
+      sectionHistory:[],
       hooks:[],
+      laneHooks:{bass:[],synth:[]},
       energyHistory:[],
+      cadenceBySection:{},
+      lastStrongHook:null,
     },
   };
 }
@@ -344,8 +424,11 @@ function buildMelodicLine(pool, chordProgression, steps, chaos, arpeMode, lenBia
   const firstChord=chordProgression[0];
   const firstNotes=chordNotes(firstChord,pool);
   let current=(memory&&memory[tailKey])||firstNotes[0]||pool[0];
+  const laneHooks=memory?.laneHooks?.[lane]||[];
+  const longHook=(laneHooks[0]?.notes)||memory?.lastStrongHook?.notes||null;
+  const hookRecallWeight=getHookRecallWeight(sectionName, blueprint?.genre||'techno');
 
-  const motif=(memory&&Array.isArray(memory[motifKey])?memory[motifKey]:null) || Array.from({length:8},(_,idx)=>{
+  const motif=((memory&&Array.isArray(memory[motifKey])?memory[motifKey]:null) || (longHook&&rnd()<hookRecallWeight?longHook:null)) || Array.from({length:8},(_,idx)=>{
     if(idx>0&&rnd()<(lane==='bass'?0.12:0.18))return null;
     const stepHint=(blueprint?.contour?.[idx]??0)+(lane==='synth'&&idx%3===2?(blueprint?.hookShift||0):0);
     const note=motifStepToNote(stepHint,firstNotes,pool,current);
@@ -359,13 +442,16 @@ function buildMelodicLine(pool, chordProgression, steps, chaos, arpeMode, lenBia
     const phraseStart=phrase*phraseLen;
     const isAnswer=phrase%2===1;
     const isRecall=phrase>1&&rnd()<(blueprint?.repetitionBias??0.62);
+    const deepRecall=longHook&&phrase>0&&rnd()<hookRecallWeight*(phrase%2===0?0.72:0.44);
     const mutateAmt=clamp((blueprint?.mutationBias??0.18)+chaos*0.16+(sectionName==='tension'?0.08:0),0.08,0.42);
     const rhythm=evolveRhythm(rhythmSource,lane,sectionName,chaos,cycleIndex+phrase);
-    const phraseMotif=motif.map((note,idx)=>{
+    const sourceMotif=deepRecall&&Array.isArray(longHook)?longHook:motif;
+    const phraseMotif=sourceMotif.map((note,idx)=>{
       if(note===null)return null;
       if(sectionName==='fill'&&idx>=4)return voiceLead(note,pool);
       if(isRecall)return note;
       if(isAnswer&&rnd()<(blueprint?.answerBias??0.32))return voiceLead(note,pool);
+      if(deepRecall&&idx===sourceMotif.length-1&&rnd()<0.4)return voiceLead(note,pool);
       if(rnd()<mutateAmt*(idx===7?1.4:1))return voiceLead(note,pool);
       return note;
     });
@@ -407,9 +493,17 @@ function buildMelodicLine(pool, chordProgression, steps, chaos, arpeMode, lenBia
   if(memory){
     memory[tailKey]=recallTail;
     memory.recentSections=[...sectionsHistory.slice(-5),sectionName];
+    const history=memory.sectionHistory||[];
+    memory.sectionHistory=[...history.slice(-11),{lane,section:sectionName,tail:recallTail,cycleIndex}];
     if(steps>=16){
-      const hookSlice=line.slice(0,16).filter(Boolean).slice(0,4);
-      if(hookSlice.length>=2)memory.hooks=[...memory.hooks.slice(-3),hookSlice];
+      const candidates=extractHookCandidates(line,active,lane,pool,sectionName);
+      if(candidates.length){
+        const best=candidates[0];
+        memory.hooks=[...(memory.hooks||[]).slice(-5),best.notes];
+        const prevLaneHooks=((memory.laneHooks&&memory.laneHooks[lane])||[]).slice();
+        memory.laneHooks={...(memory.laneHooks||{}),[lane]:[best,...prevLaneHooks].slice(0,4)};
+        if(!memory.lastStrongHook || best.score>=memory.lastStrongHook.score-0.08)memory.lastStrongHook={...best,lane,section:sectionName};
+      }
     }
   }
 
@@ -436,7 +530,9 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
 
   const density = gd.density, chaos = gd.chaos;
   const soundCharacter = blueprint?.soundCharacter || getGenreSoundCharacter(genre);
-  const charCfg = getCharacterConfig(soundCharacter);
+  const charCfg = mergeCharacterAndGenre(soundCharacter, genre);
+  const genreFamily = blueprint?.genreFamily || getGenreFamilyProfile(genre);
+  const fillMode = chooseTransitionFillMode(sectionName, blueprint?.memory, genre);
   const sectionVisits = blueprint?.memory?.sectionVisits || {};
   const visitCount = sectionVisits[sectionName] || 0;
   if(blueprint?.memory)blueprint.memory.sectionVisits[sectionName] = visitCount + 1;
@@ -444,11 +540,15 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
   const structuredBars = createStructuredBarProfile(sectionName, Math.max(1, Math.ceil(Math.max(laneLen.kick,laneLen.snare,laneLen.hat,laneLen.bass,laneLen.synth)/16)), visitCount, cycleIndex, macroEnergy, soundCharacter);
   if(blueprint?.memory){
     const eh=blueprint.memory.energyHistory||[];
-    blueprint.memory.energyHistory=[...eh.slice(-11),{section:sectionName,energy:macroEnergy}];
+    blueprint.memory.energyHistory=[...eh.slice(-11),{section:sectionName,energy:macroEnergy,fillMode,cycleIndex}];
+    const cadence=blueprint.memory.cadenceBySection||{};
+    blueprint.memory.cadenceBySection={...cadence,[sectionName]:{energy:macroEnergy,fillMode,visit:visitCount+1}};
   }
 
-  const bassLb = sec.lb * (sectionName === 'break' ? 2.5 : sectionName === 'drop' ? 0.8 : 1) * (0.94 + macroEnergy * 0.12);
-  const synthLb = sec.lb * (sectionName === 'break' ? 3 : genre === 'ambient' ? 4 : 1.2) * (0.92 + macroEnergy * 0.14);
+  const bassRoleBias = genreFamily.bassRole==='drone'?1.4:genreFamily.bassRole==='lead'?0.72:genreFamily.bassRole==='pulse'?0.88:genreFamily.bassRole==='pressure'?0.8:genreFamily.bassRole==='pedal'?1.55:1;
+  const synthRoleBias = genreFamily.synthRole==='wash'?2.2:genreFamily.synthRole==='theme'?1.7:genreFamily.synthRole==='chord'?1.45:genreFamily.synthRole==='stab'?0.9:genreFamily.synthRole==='shard'?0.86:1.2;
+  const bassLb = sec.lb * (sectionName === 'break' ? 2.5 : sectionName === 'drop' ? 0.8 : 1) * (0.94 + macroEnergy * 0.12) * bassRoleBias;
+  const synthLb = sec.lb * (sectionName === 'break' ? 3 : genre === 'ambient' ? 4 : 1.2) * (0.92 + macroEnergy * 0.14) * synthRoleBias;
   const bassBuilt = buildMelodicLine(bp, progression, laneLen.bass, chaos, arpeMode, bassLb, {lane:'bass', sectionName, blueprint, cycleIndex:cycleIndex+visitCount});
   const synthBuilt = buildMelodicLine(sp, progression, laneLen.synth, chaos * 0.72, arpeMode, synthLb, {lane:'synth', sectionName, blueprint, cycleIndex:cycleIndex+visitCount});
   const {line: bassLine, lengths: bassLengths, active: bassActive} = bassBuilt;
@@ -464,8 +564,9 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
     const ll = laneLen[lane];
     const lmKey = lane === 'kick' ? 'kM' : lane === 'snare' ? 'sM' : lane === 'hat' ? 'hM' : lane === 'bass' ? 'bM' : 'syM';
     const lm = sec[lmKey] || 1;
-    const dm = density * lm * (0.92 + macroEnergy * 0.16) * (1 + charCfg.motionBias * 0.08);
-    const maxDensity = (lane === 'bass' ? 0.72 : lane === 'synth' ? 0.58 : 1.0) * clamp(0.94 + macroEnergy * 0.1 + charCfg.accentBias * 0.04,0.84,1.08);
+    const familyLift = 1 + (lane==='bass'?genreFamily.motion*0.18:lane==='synth'?genreFamily.hookBias*0.06:genreFamily.accent*0.12);
+    const dm = density * lm * (0.92 + macroEnergy * 0.16) * (1 + charCfg.motionBias * 0.08) * familyLift;
+    const maxDensity = (lane === 'bass' ? 0.72 : lane === 'synth' ? 0.58 : 1.0) * clamp(0.94 + macroEnergy * 0.1 + charCfg.accentBias * 0.04 + genreFamily.accent * 0.08,0.84,1.14);
     const totalBars = Math.max(1, Math.ceil(ll / 16));
 
     for(let i = 0; i < ll; i++){
@@ -494,7 +595,7 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
       else if(lane === 'snare'){
         if(gd.hatPattern === 'breakbeat') hit = backbeat || rnd() < (groove.sB + dm * 0.12) * (1 + pb * 0.18);
         else hit = backbeat || rnd() < (groove.sB + dm * 0.06 + (backbeat ? 0.24 : 0)) * (1.02 - pw * 0.14);
-        if(sectionName === 'fill' && pos >= 12) hit = pos !== 15;
+        if(sectionName === 'fill' && pos >= 12) hit = fillMode==='air-gap'?pos===12||pos===14:fillMode==='break-rush'?pos!==15:(pos !== 15);
         if(sectionName === 'intro') hit = hit && (pos === 12 || (barIndex % 2 === 1 && pos === 4));
       }
       else if(lane === 'hat'){
@@ -507,6 +608,8 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
         else hit = rnd() < (groove.hB + dm * 0.18) * (0.82 + pw * 0.22);
         if(sectionName === 'break') hit = hit && (pos % 4 === 2);
         if(sectionName === 'build' && endOfBar) hit = true;
+        if(sectionName === 'fill' && fillMode==='re-entry') hit = hit || pos===10 || pos===15;
+        if(sectionName === 'fill' && fillMode==='air-gap') hit = hit && (pos===6 || pos===10 || pos===14);
         if(hit && rnd() < chaos * 0.3) p.hat[i].p = 0.45 + rnd() * 0.4;
       }
       else if(lane === 'bass'){
@@ -515,6 +618,7 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
         const prob = anchorBoost ? 0.86 * lm : (groove.bB + dm * 0.1 + sectionE * 0.06) * pw * 0.68;
         hit = melodicGate && rnd() < Math.min(prob, maxDensity);
         if(sectionName === 'drop' && anchorBoost) hit = true;
+        if(sectionName === 'break' && genreFamily.bassRole==='pedal') hit = hit && (pos===0||pos===8);
       }
       else if(lane === 'synth'){
         const phraseOn = pos === 2 || pos === 6 || pos === 10 || pos === 14;
@@ -522,12 +626,14 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
         const prob = phraseOn ? 0.68 * lm : (groove.syB + dm * 0.07 + sectionE * 0.05) * pw * 0.52;
         hit = melodicGate && ((rnd() < Math.min(prob, maxDensity) && !strong) || (pb === 3 && rnd() < 0.18 + chaos * 0.15));
         if(sectionName === 'break') hit = melodicGate && (phraseOn || pos === 0);
+        if(sectionName === 'drop' && blueprint?.memory?.lastStrongHook?.lane==='synth' && (pos===2||pos===10)) hit = true;
       }
 
       if(hit){
         p[lane][i].on = true;
         p[lane][i].p = clamp(sec.pb + rnd() * (1 - sec.pb), sec.pb, 1);
-        p[lane][i].v = clamp(velCurve(sec.vel, i, ll, pw) * (sectionName==='build' ? 0.88 + barPhase * 0.18 : 1) * (0.94 + macroEnergy * 0.12 + charCfg.accentBias * 0.08), 0.22, 1);
+        const fillVelocityBias = sectionName==='fill' ? (fillMode==='impact'||fillMode==='re-entry'?1.12:fillMode==='air-gap'?0.84:fillMode==='break-rush'?1.08:1) : 1;
+        p[lane][i].v = clamp(velCurve(sec.vel, i, ll, pw) * (sectionName==='build' ? 0.88 + barPhase * 0.18 : 1) * fillVelocityBias * (0.94 + macroEnergy * 0.12 + charCfg.accentBias * 0.08 + genreFamily.accent * 0.06), 0.22, 1);
         if(lane === 'bass') p[lane][i].l = bassLengths[i] || sec.lb;
         else if(lane === 'synth') p[lane][i].l = synthLengths[i] || sec.lb;
         else p[lane][i].l = 1;
@@ -544,7 +650,16 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
   }
   if(sectionName === 'fill'){
     const ll = laneLen.snare;
-    for(let i = 0; i < ll; i++) if(i % 16 >= 12) p.snare[i].on = true;
+    for(let i = 0; i < ll; i++){
+      const pos=i%16;
+      if(fillMode==='air-gap') p.snare[i].on = pos===12 || pos===14;
+      else if(fillMode==='break-rush') p.snare[i].on = pos>=10 && pos!==13;
+      else if(fillMode==='re-entry') p.snare[i].on = pos===8 || pos===10 || pos===12 || pos===15;
+      else if(pos>=12) p.snare[i].on = true;
+    }
+    if(fillMode==='lift'){
+      for(let i=0;i<laneLen.hat;i++) if(i%16>=8) p.hat[i].on = true;
+    }
   }
 
   for(const lane of ['bass', 'synth']){
@@ -584,6 +699,7 @@ function buildSong(genre){
   const arc=pick(SONG_ARCS);
   const composition=createCompositionBlueprint(genre,modeName,progression,arpeMode);
   const soundCharacter=composition.soundCharacter;
+  const genreFamily=composition.genreFamily;
   const sections=arc.map((name,idx)=>({
     name,
     modeName,
@@ -592,9 +708,10 @@ function buildSong(genre){
     genre,
     energy:sectionEnergy(name),
     soundCharacter,
+    genreFamily,
     order:idx,
   }));
-  return{genre,modeName,progression,arpeMode,bpm,arc,sections,currentSection:0,composition,soundCharacter};
+  return{genre,modeName,progression,arpeMode,bpm,arc,sections,currentSection:0,composition,soundCharacter,genreFamily};
 }
 
 // ─── GROOVE ACCENT TABLE ──────────────────────────────────────────────────────
@@ -1572,7 +1689,7 @@ export default function App(){
   const serialize=()=>({
     v:4,genre,modeName,bpm,currentSectionName,grooveProfile,arpMode:arpModeRef.current,progression:progressionRef.current,
     space,tone,noiseMix,drive,compress,bassFilter,synthFilter,drumDecay,bassSubAmt,fmIdx,
-    master,swing,humanize,grooveAmt,projectName,polySynth,bassStack,bassPreset,synthPreset,drumPreset,performancePreset,soundCharacter,compositionEnergy,
+    master,swing,humanize,grooveAmt,projectName,polySynth,bassStack,bassPreset,synthPreset,drumPreset,performancePreset,soundCharacter,compositionEnergy,genreFamily:compositionRef.current?.genreFamily||getGenreFamilyProfile(genre),
     patterns,bassLine,synthLine,laneLen,
   });
   const applySnap=(snap)=>{
@@ -1584,6 +1701,7 @@ export default function App(){
     setArpMode(snap.arpMode||'up');arpModeRef.current=snap.arpMode||'up';
     compositionRef.current=createCompositionBlueprint(snap.genre||'techno',snap.modeName||'minor',progressionRef.current,arpModeRef.current);
     compositionRef.current.soundCharacter=snap.soundCharacter||compositionRef.current.soundCharacter||getGenreSoundCharacter(snap.genre||'techno');
+    compositionRef.current.genreFamily=snap.genreFamily||compositionRef.current.genreFamily||getGenreFamilyProfile(snap.genre||'techno');
     compositionCycleRef.current=0;
     setSpace(snap.space??0.3);setTone(snap.tone??0.7);setNoiseMix(snap.noiseMix??0.2);setDrive(snap.drive??0.1);
     setCompress(snap.compress??0.3);setBassFilter(snap.bassFilter??0.55);setSynthFilter(snap.synthFilter??0.65);
