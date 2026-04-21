@@ -191,73 +191,189 @@ function velCurve(type,i,total,pw){
 
 // ─── MELODIC PHRASE BUILDER ───────────────────────────────────────────────────
 // Creates real melodic phrases: 4-bar motifs, repetitions, silences, legato
-function buildMelodicLine(pool, chordProgression, steps, chaos, arpeMode, lenBias){
-  const line = mkNotes(pool[0]);
-  const lengths = Array(steps).fill(1); // per-step note length in steps
-  const chordLen = Math.max(1, Math.floor(steps / 4));
-
-  // 1. Build a 4-step motif from chord tones
-  const motif = [];
-  const motifLen = 4;
-  const firstChord = chordProgression[0];
-  const firstPool = chordNotes(firstChord, pool);
-  let lastNote = firstPool[0];
-  for(let m = 0; m < motifLen; m++){
-    const r = rnd();
-    if(r < 0.15) motif.push(null); // rest in motif
-    else if(r < 0.35) motif.push(lastNote); // repeat
-    else{
-      // Voice lead to next chord tone
-      const near = firstPool.reduce((best, n) => {
-        return Math.abs(pool.indexOf(n) - pool.indexOf(lastNote)) < Math.abs(pool.indexOf(best) - pool.indexOf(lastNote)) ? n : best;
-      }, firstPool[0]);
-      lastNote = near;
-      motif.push(near);
-    }
-  }
-
-  // 2. Place motif across pattern with variations per chord section
-  for(let i = 0; i < steps; i++){
-    const ci = Math.floor(i / chordLen) % chordProgression.length;
-    const chord = chordProgression[ci];
-    const cn = chordNotes(chord, pool);
-    const motifPos = i % motifLen;
-    const motifNote = motif[motifPos];
-
-    if(motifNote === null){
-      line[i] = pool[0]; // placeholder — step will be off anyway
-    } else {
-      // Transpose motif note to current chord context, respecting voice leading
-      if(rnd() < 0.72){
-        // Stay close to the motif note within new chord context
-        const transposed = cn.reduce((best, n) =>
-          Math.abs(pool.indexOf(n) - pool.indexOf(motifNote)) < Math.abs(pool.indexOf(best) - pool.indexOf(motifNote)) ? n : best
-        , cn[0]);
-        line[i] = transposed;
-      } else {
-        // Occasional free note within scale (chaos-driven)
-        line[i] = rnd() < chaos ? pick(pool) : voiceLead(line[Math.max(0, i-1)], cn);
-      }
-    }
-
-    // Note lengths — longer in breaks/ambient, shorter in drops/fills
-    const r = rnd();
-    if(r < 0.45) lengths[i] = lenBias;
-    else if(r < 0.65) lengths[i] = lenBias * 2; // hold across 2 steps
-    else if(r < 0.82) lengths[i] = Math.max(0.5, lenBias * 0.5);
-    else lengths[i] = lenBias * 3; // long sustain
-    lengths[i] = Math.min(lengths[i], 8); // never exceed 8 steps
-  }
-
-  // Fill remainder
-  for(let i = steps; i < MAX_STEPS; i++){
-    line[i] = line[i % Math.max(1, steps)];
-  }
-
-  return { line, lengths };
+function sectionEnergy(sectionName){
+  const T={intro:0.24,build:0.56,drop:1,groove:0.74,break:0.2,tension:0.68,outro:0.18,fill:0.86};
+  return T[sectionName] ?? 0.6;
 }
 
-function buildSection(genre, sectionName, modeName, progression, arpeMode, prevBass){
+function createCompositionBlueprint(genre, modeName, progression, arpeMode){
+  const contour=[0];
+  for(let i=1;i<8;i++){
+    const move=pick([-2,-1,-1,0,1,1,2]);
+    contour.push(clamp(contour[i-1]+move,-3,4));
+  }
+  const rhythmicSets={
+    bass:[
+      [0,4,7,10,12],
+      [0,3,6,8,12,14],
+      [0,5,8,11,12],
+      [0,2,7,10,12,15],
+    ],
+    synth:[
+      [2,6,10,14],
+      [3,7,11,15],
+      [2,5,10,13,14],
+      [1,6,9,14],
+    ],
+  };
+  const hookShift=pick([-2,-1,1,2]);
+  return{
+    id:`${genre}-${modeName}-${Date.now()}-${Math.floor(rnd()*9999)}`,
+    genre,modeName,arpeMode,progression,
+    contour,
+    bassRhythm:pick(rhythmicSets.bass).slice(),
+    synthRhythm:pick(rhythmicSets.synth).slice(),
+    hookShift,
+    answerBias:0.28+rnd()*0.26,
+    repetitionBias:0.58+rnd()*0.18,
+    mutationBias:0.16+rnd()*0.18,
+    memory:{
+      bassMotif:null,
+      synthMotif:null,
+      previousBassTail:null,
+      previousSynthTail:null,
+      sectionVisits:{},
+      recentSections:[],
+      hooks:[],
+    },
+  };
+}
+
+function evolveRhythm(base, lane, sectionName, chaos, cycleIndex){
+  const evolved=[...base];
+  if(sectionName==='fill')return Array.from(new Set([...evolved,12,13,14,15])).sort((a,b)=>a-b);
+  if(sectionName==='break')return evolved.filter(p=>lane==='bass'?p===0||p===8:p===2||p===10);
+  if(sectionName==='intro')return evolved.filter((_,i)=>i<Math.max(2,Math.ceil(evolved.length*0.55)));
+  if(sectionName==='outro')return evolved.filter((p,i)=>i<Math.max(2,Math.ceil(evolved.length*0.45))&&p<12);
+  if(sectionName==='build'){
+    evolved.push(14);
+    if(cycleIndex%2===1)evolved.push(15);
+  }
+  if(sectionName==='drop'){
+    evolved.push(lane==='bass'?15:13);
+    if(chaos>0.45)evolved.push(lane==='bass'?11:9);
+  }
+  return Array.from(new Set(evolved.filter(p=>p>=0&&p<16))).sort((a,b)=>a-b);
+}
+
+function motifStepToNote(stepHint, chordNotePool, globalPool, previous){
+  const source=(chordNotePool&&chordNotePool.length)?chordNotePool:[globalPool[0]];
+  const fallback=source[0] || globalPool[0];
+  const baseIdx=Math.max(0,globalPool.indexOf(fallback));
+  const target=baseIdx+stepHint;
+  const candidates=source.slice().sort((a,b)=>{
+    const da=Math.abs(globalPool.indexOf(a)-target);
+    const db=Math.abs(globalPool.indexOf(b)-target);
+    return da-db;
+  });
+  if(previous && candidates.includes(previous) && rnd()<0.18)return previous;
+  return candidates[0] || fallback;
+}
+
+function chooseLength(sectionName, lane, lenBias, localStep, energy){
+  const anchor=(localStep%8===0);
+  if(sectionName==='break')return Math.min(8,Math.max(1.5,lenBias*(lane==='synth'?3.2:2.2)));
+  if(sectionName==='fill')return Math.max(0.5,lenBias*(anchor?0.8:0.5));
+  if(sectionName==='drop')return Math.max(0.5,lenBias*(anchor?1.25:0.82));
+  if(sectionName==='intro'||sectionName==='outro')return Math.min(8,Math.max(1,lenBias*(anchor?2.4:1.6)));
+  return Math.min(8,Math.max(0.5,lenBias*(anchor?1.9:1.05+energy*0.5)));
+}
+
+// ─── MELODIC PHRASE BUILDER ───────────────────────────────────────────────────
+// Creates motif/reply phrases with recall, section energy and controlled mutation
+function buildMelodicLine(pool, chordProgression, steps, chaos, arpeMode, lenBias, options={}){
+  const {lane='bass',sectionName='groove',blueprint=null,cycleIndex=0}=options;
+  const line=mkNotes(pool[0]);
+  const lengths=Array(steps).fill(1);
+  const active=Array(steps).fill(false);
+  const phraseLen=16;
+  const phraseCount=Math.max(1,Math.ceil(steps/phraseLen));
+  const energy=sectionEnergy(sectionName);
+  const memory=blueprint?.memory;
+  const motifKey=lane==='bass'?'bassMotif':'synthMotif';
+  const tailKey=lane==='bass'?'previousBassTail':'previousSynthTail';
+  const rhythmSource=lane==='bass'?(blueprint?.bassRhythm||[0,4,8,12]):(blueprint?.synthRhythm||[2,6,10,14]);
+  const firstChord=chordProgression[0];
+  const firstNotes=chordNotes(firstChord,pool);
+  let current=(memory&&memory[tailKey])||firstNotes[0]||pool[0];
+
+  const motif=(memory&&Array.isArray(memory[motifKey])?memory[motifKey]:null) || Array.from({length:8},(_,idx)=>{
+    if(idx>0&&rnd()<(lane==='bass'?0.12:0.18))return null;
+    const stepHint=(blueprint?.contour?.[idx]??0)+(lane==='synth'&&idx%3===2?(blueprint?.hookShift||0):0);
+    const note=motifStepToNote(stepHint,firstNotes,pool,current);
+    current=note||current;
+    return note;
+  });
+
+  if(memory&&!memory[motifKey])memory[motifKey]=[...motif];
+
+  for(let phrase=0;phrase<phraseCount;phrase++){
+    const phraseStart=phrase*phraseLen;
+    const isAnswer=phrase%2===1;
+    const isRecall=phrase>1&&rnd()<(blueprint?.repetitionBias??0.62);
+    const mutateAmt=clamp((blueprint?.mutationBias??0.18)+chaos*0.16+(sectionName==='tension'?0.08:0),0.08,0.42);
+    const rhythm=evolveRhythm(rhythmSource,lane,sectionName,chaos,cycleIndex+phrase);
+    const phraseMotif=motif.map((note,idx)=>{
+      if(note===null)return null;
+      if(sectionName==='fill'&&idx>=4)return voiceLead(note,pool);
+      if(isRecall)return note;
+      if(isAnswer&&rnd()<(blueprint?.answerBias??0.32))return voiceLead(note,pool);
+      if(rnd()<mutateAmt*(idx===7?1.4:1))return voiceLead(note,pool);
+      return note;
+    });
+
+    for(let local=0;local<phraseLen&&phraseStart+local<steps;local++){
+      const abs=phraseStart+local;
+      const chordIndex=Math.floor(abs/Math.max(1,Math.floor(steps/chordProgression.length)))%chordProgression.length;
+      const chordPool=chordNotes(chordProgression[chordIndex],pool);
+      const on=rhythm.includes(local%16)&&!(sectionName==='break'&&lane==='bass'&&local%16===12&&rnd()<0.6);
+      active[abs]=on;
+      const motifSlot=Math.floor(local/2)%phraseMotif.length;
+      const motifNote=phraseMotif[motifSlot];
+      const anchor=local%8===0;
+
+      let note=motifNote;
+      if(note===null&&on&&lane==='bass')note=chordPool[0]||pool[0];
+      if(note===null&&on&&lane==='synth')note=arp(chordPool.length?chordPool:pool,arpeMode,local+cycleIndex);
+
+      if(note!==null){
+        const nearest=(chordPool.length?chordPool:pool).reduce((best,n)=>
+          Math.abs(pool.indexOf(n)-pool.indexOf(note))<Math.abs(pool.indexOf(best)-pool.indexOf(note))?n:best
+        ,(chordPool.length?chordPool:pool)[0]);
+        if(on)note=nearest;
+      }else{
+        note=line[Math.max(0,abs-1)]||pool[0];
+      }
+
+      if(anchor&&lane==='bass'&&rnd()<0.72)note=chordPool[0]||note;
+      if(anchor&&lane==='synth'&&sectionName!=='break'&&rnd()<0.4)note=arp(chordPool.length?chordPool:pool,arpeMode,phrase+local);
+
+      line[abs]=note;
+      lengths[abs]=chooseLength(sectionName,lane,lenBias,local,energy);
+      if(on&&local%16===15&&sectionName!=='fill'&&rnd()<0.38)lengths[abs]=Math.min(8,lengths[abs]+1.5);
+    }
+  }
+
+  const sectionsHistory=memory?.recentSections||[];
+  const recallTail=(lane==='bass'?line[Math.max(0,steps-4)]:line[Math.max(0,steps-2)])||current;
+  if(memory){
+    memory[tailKey]=recallTail;
+    memory.recentSections=[...sectionsHistory.slice(-5),sectionName];
+    if(steps>=16){
+      const hookSlice=line.slice(0,16).filter(Boolean).slice(0,4);
+      if(hookSlice.length>=2)memory.hooks=[...memory.hooks.slice(-3),hookSlice];
+    }
+  }
+
+  for(let i=steps;i<MAX_STEPS;i++){
+    line[i]=line[i%Math.max(1,steps)];
+  }
+
+  return{line,lengths,active,motif:[...motif]};
+}
+
+
+function buildSection(genre, sectionName, modeName, progression, arpeMode, prevBass, blueprint=null, cycleIndex=0){
   const sec = SECTIONS[sectionName] || SECTIONS.groove;
   const gd = GENRES[genre];
   const grooveName = gd.density > 0.65 && gd.chaos > 0.4 ? 'bunker' : gd.chaos > 0.6 ? 'broken' : gd.density < 0.4 ? 'float' : 'steady';
@@ -270,73 +386,90 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
   if(genre === 'acid'){laneLen.bass = 16; laneLen.synth = 32;}
   if(genre === 'cinematic'){laneLen.bass = 64; laneLen.synth = 64;}
 
-  const masterLen = Math.max(...Object.values(laneLen));
   const density = gd.density, chaos = gd.chaos;
+  const sectionVisits = blueprint?.memory?.sectionVisits || {};
+  const visitCount = sectionVisits[sectionName] || 0;
+  if(blueprint?.memory)blueprint.memory.sectionVisits[sectionName] = visitCount + 1;
 
-  // ── BUILD MELODIC LINES with real phrase logic ──
   const bassLb = sec.lb * (sectionName === 'break' ? 2.5 : sectionName === 'drop' ? 0.8 : 1);
-  const synthLb = sec.lb * (sectionName === 'break' ? 3 : sectionName === 'ambient' ? 4 : 1.2);
-  const {line: bassLine, lengths: bassLengths} = buildMelodicLine(bp, progression, laneLen.bass, chaos, arpeMode, bassLb);
-  const {line: synthLine, lengths: synthLengths} = buildMelodicLine(sp, progression, laneLen.synth, chaos * 0.7, arpeMode, synthLb);
+  const synthLb = sec.lb * (sectionName === 'break' ? 3 : genre === 'ambient' ? 4 : 1.2);
+  const bassBuilt = buildMelodicLine(bp, progression, laneLen.bass, chaos, arpeMode, bassLb, {lane:'bass', sectionName, blueprint, cycleIndex:cycleIndex+visitCount});
+  const synthBuilt = buildMelodicLine(sp, progression, laneLen.synth, chaos * 0.72, arpeMode, synthLb, {lane:'synth', sectionName, blueprint, cycleIndex:cycleIndex+visitCount});
+  const {line: bassLine, lengths: bassLengths, active: bassActive} = bassBuilt;
+  const {line: synthLine, lengths: synthLengths, active: synthActive} = synthBuilt;
+  if(prevBass && bassLine.length)bassLine[0] = voiceLead(prevBass, [bassLine[0], ...(chordNotes(progression[0], bp))].filter(Boolean));
 
   const p = {kick:mkSteps(), snare:mkSteps(), hat:mkSteps(), bass:mkSteps(), synth:mkSteps()};
   const bar = 16;
-  const phraseW = [1, 0.75, 0.92, 0.68];
+  const phraseW = [1, 0.78, 0.94, 0.7];
+  const sectionE = sectionEnergy(sectionName);
 
-  // ── RHYTHMIC PATTERN with musical density control ──
   for(const lane of ['kick','snare','hat','bass','synth']){
     const ll = laneLen[lane];
-    // Use correct multiplier key per lane
     const lmKey = lane === 'kick' ? 'kM' : lane === 'snare' ? 'sM' : lane === 'hat' ? 'hM' : lane === 'bass' ? 'bM' : 'syM';
     const lm = sec[lmKey] || 1;
     const dm = density * lm;
-    // Bass and synth: enforce maximum density to avoid mud
-    const maxDensity = lane === 'bass' ? 0.55 : lane === 'synth' ? 0.45 : 1.0;
+    const maxDensity = lane === 'bass' ? 0.72 : lane === 'synth' ? 0.58 : 1.0;
+    const totalBars = Math.max(1, Math.ceil(ll / 16));
 
     for(let i = 0; i < ll; i++){
-      const pos = i % bar, pb = Math.floor(i / 8) % 4;
-      const strong = pos === 0 || pos === 8, bb = pos === 4 || pos === 12, ob = pos % 2 === 1;
-      const pw = phraseW[pb];
+      const pos = i % bar;
+      const pb = Math.floor(i / 8) % 4;
+      const barIndex = Math.floor(i / 16);
+      const barPhase = totalBars <= 1 ? 1 : barIndex / (totalBars - 1);
+      const strong = pos === 0 || pos === 8;
+      const backbeat = pos === 4 || pos === 12;
+      const offbeat = pos % 2 === 1;
+      const endOfBar = pos >= 12;
+      const pw = phraseW[pb] * (sectionName === 'build' ? 0.82 + barPhase * 0.34 : sectionName === 'outro' ? 1.06 - barPhase * 0.24 : 1);
       let hit = false;
 
       if(lane === 'kick'){
-        if(gd.kick === 'every4' && pos % 4 === 0) hit = true;
-        else if(gd.kick === 'syncopated' && (pos === 0 || pos === 10 || pos === 14)) hit = true;
-        else if(gd.kick === 'sparse' && (pos === 0 || pos === 12)) hit = true;
-        else if(gd.kick === 'irregular') hit = pos === 0 || (rnd() < dm * 0.3 * pw);
-        else if(strong || rnd() < (groove.kB + dm * 0.18) * pw) hit = true;
+        if(gd.kick === 'every4') hit = pos % 4 === 0 || (sectionName === 'fill' && pos === 14);
+        else if(gd.kick === 'syncopated') hit = pos === 0 || pos === 10 || pos === 14 || (sectionName === 'drop' && pos === 6);
+        else if(gd.kick === 'sparse') hit = pos === 0 || (sectionName === 'build' && pos === 12);
+        else if(gd.kick === 'irregular') hit = pos === 0 || rnd() < dm * 0.28 * pw;
+        else hit = strong || rnd() < (groove.kB + dm * 0.16 + (endOfBar && sectionName === 'fill' ? 0.2 : 0)) * pw;
+        if(sectionName === 'break') hit = hit && (pos === 0 || pos === 12);
+        if(sectionName === 'build' && barPhase > 0.5 && (pos === 12 || pos === 14)) hit = true;
       }
       else if(lane === 'snare'){
-        if(gd.hatPattern === 'breakbeat') hit = rnd() < (groove.sB + dm * 0.15) * (1 + pb * 0.2);
-        else if(bb || rnd() < (groove.sB + dm * 0.08 + (bb ? 0.28 : 0)) * (1.05 - pw * 0.16)) hit = true;
+        if(gd.hatPattern === 'breakbeat') hit = backbeat || rnd() < (groove.sB + dm * 0.12) * (1 + pb * 0.18);
+        else hit = backbeat || rnd() < (groove.sB + dm * 0.06 + (backbeat ? 0.24 : 0)) * (1.02 - pw * 0.14);
+        if(sectionName === 'fill' && pos >= 12) hit = pos !== 15;
+        if(sectionName === 'intro') hit = hit && (pos === 12 || (barIndex % 2 === 1 && pos === 4));
       }
       else if(lane === 'hat'){
         const hatP = gd.hatPattern;
         if(hatP === '16th') hit = true;
-        else if(hatP === 'offbeat') hit = ob;
+        else if(hatP === 'offbeat') hit = offbeat;
         else if(hatP === 'breakbeat') hit = rnd() < (groove.hB + dm * 0.22) * (0.8 + pw * 0.25);
         else if(hatP === 'noise') hit = rnd() < 0.55 + dm * 0.18;
         else if(hatP === 'sparse') hit = rnd() < 0.2 + dm * 0.1;
         else hit = rnd() < (groove.hB + dm * 0.18) * (0.82 + pw * 0.22);
-        if(hit && rnd() < chaos * 0.3) p.hat[i].p = 0.45 + rnd() * 0.4; // ghost hits
+        if(sectionName === 'break') hit = hit && (pos % 4 === 2);
+        if(sectionName === 'build' && endOfBar) hit = true;
+        if(hit && rnd() < chaos * 0.3) p.hat[i].p = 0.45 + rnd() * 0.4;
       }
-      // Bass: play at phrase anchor points primarily
       else if(lane === 'bass'){
-        const phraseAnchor = pos === 0 || pos === 4 || pos === 8 || pos === 12;
-        const prob = phraseAnchor ? 0.82 * lm : (groove.bB + dm * 0.12) * pw * 0.7;
-        hit = rnd() < Math.min(prob, maxDensity);
+        const anchorBoost = strong || pos === 4 || pos === 12;
+        const melodicGate = !!bassActive[i];
+        const prob = anchorBoost ? 0.86 * lm : (groove.bB + dm * 0.1 + sectionE * 0.06) * pw * 0.68;
+        hit = melodicGate && rnd() < Math.min(prob, maxDensity);
+        if(sectionName === 'drop' && anchorBoost) hit = true;
       }
-      // Synth: more sparse, on off-beats of phrased positions
       else if(lane === 'synth'){
         const phraseOn = pos === 2 || pos === 6 || pos === 10 || pos === 14;
-        const prob = phraseOn ? 0.65 * lm : (groove.syB + dm * 0.08) * pw * 0.5;
-        hit = (rnd() < Math.min(prob, maxDensity) && !strong) || (pb === 3 && rnd() < 0.18 + chaos * 0.15);
+        const melodicGate = !!synthActive[i];
+        const prob = phraseOn ? 0.68 * lm : (groove.syB + dm * 0.07 + sectionE * 0.05) * pw * 0.52;
+        hit = melodicGate && ((rnd() < Math.min(prob, maxDensity) && !strong) || (pb === 3 && rnd() < 0.18 + chaos * 0.15));
+        if(sectionName === 'break') hit = melodicGate && (phraseOn || pos === 0);
       }
 
       if(hit){
         p[lane][i].on = true;
         p[lane][i].p = clamp(sec.pb + rnd() * (1 - sec.pb), sec.pb, 1);
-        p[lane][i].v = clamp(velCurve(sec.vel, i, ll, pw), 0.22, 1);
+        p[lane][i].v = clamp(velCurve(sec.vel, i, ll, pw) * (sectionName==='build' ? 0.88 + barPhase * 0.18 : 1), 0.22, 1);
         if(lane === 'bass') p[lane][i].l = bassLengths[i] || sec.lb;
         else if(lane === 'synth') p[lane][i].l = synthLengths[i] || sec.lb;
         else p[lane][i].l = 1;
@@ -344,7 +477,6 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
     }
   }
 
-  // Rhythmic anchors — always present
   for(let i = 0; i < laneLen.kick; i += 16) p.kick[i].on = true;
   if(gd.kick !== 'sparse' && sectionName !== 'break'){
     for(let i = 0; i < laneLen.snare; i += 16){
@@ -352,36 +484,35 @@ function buildSection(genre, sectionName, modeName, progression, arpeMode, prevB
       if(i + 12 < laneLen.snare) p.snare[i + 12].on = true;
     }
   }
+  if(sectionName === 'fill'){
+    const ll = laneLen.snare;
+    for(let i = 0; i < ll; i++) if(i % 16 >= 12) p.snare[i].on = true;
+  }
 
-  // Implement legature: when a step has l>1, mark subsequent steps as "tied" (on=false, held by prev)
-  // This prevents double-triggering and creates real sustained notes
   for(const lane of ['bass', 'synth']){
     const ll = laneLen[lane];
     for(let i = 0; i < ll; i++){
       if(p[lane][i].on && p[lane][i].l > 1){
         const holdEnd = Math.min(ll - 1, i + Math.floor(p[lane][i].l));
         for(let j = i + 1; j <= holdEnd; j++){
-          p[lane][j].tied = true; // mark as held — scheduler skips these
-          p[lane][j].on = false;  // visually show as held
+          p[lane][j].tied = true;
+          p[lane][j].on = false;
         }
       }
     }
   }
 
-  // Mild chaos mutations on drums only — never on melodic lanes
-  const mp = Math.floor(chaos * 5);
+  const mp = Math.floor(chaos * 4);
   for(let m = 0; m < mp; m++){
     const ln = pick(['kick','snare','hat']);
     const ll = laneLen[ln];
     const pos = Math.floor(rnd() * ll);
     if(ln === 'hat') p.hat[pos].on = !p.hat[pos].on;
-    else if(ln === 'kick'){if(pos % 4 !== 0) p.kick[pos].on = rnd() < 0.35 + chaos * 0.18;}
+    else if(ln === 'kick'){if(pos % 4 !== 0) p.kick[pos].on = rnd() < 0.28 + chaos * 0.16;}
     else{p.snare[pos].on = !p.snare[pos].on && pos % 4 !== 0;}
   }
 
-  // Track lastBass from generated line
-  const lb = bassLine[laneLen.bass - 1] || bp[0];
-
+  const lb = bassLine[Math.max(0,laneLen.bass - 1)] || bp[0];
   return {patterns:p, bassLine, synthLine, laneLen, lastBass:lb};
 }
 
@@ -393,11 +524,17 @@ function buildSong(genre){
   const arpeMode=pick(['up','down','updown','outside']);
   const bpm=Math.round(gd.bpm[0]+rnd()*(gd.bpm[1]-gd.bpm[0]));
   const arc=pick(SONG_ARCS);
-  const sections=arc.map((name,idx)=>{
-    const prev=idx>0?sections_:null; // will be filled
-    return{name,modeName,progression,arpeMode,genre};
-  });
-  return{genre,modeName,progression,arpeMode,bpm,arc,sections,currentSection:0};
+  const composition=createCompositionBlueprint(genre,modeName,progression,arpeMode);
+  const sections=arc.map((name,idx)=>({
+    name,
+    modeName,
+    progression,
+    arpeMode,
+    genre,
+    energy:sectionEnergy(name),
+    order:idx,
+  }));
+  return{genre,modeName,progression,arpeMode,bpm,arc,sections,currentSection:0,composition};
 }
 
 // ─── GROOVE ACCENT TABLE ──────────────────────────────────────────────────────
@@ -585,6 +722,8 @@ export default function App(){
   const lastBassRef=useRef('C2');
   const progressionRef=useRef(CHORD_PROGS.minor[0]);
   const arpModeRef=useRef('up');
+  const compositionRef=useRef(createCompositionBlueprint('techno','minor',CHORD_PROGS.minor[0],'up'));
+  const compositionCycleRef=useRef(0);
   const [arpMode,setArpMode]=useState('up');
 
   // ── UI state
@@ -1051,7 +1190,8 @@ export default function App(){
     const prog=progressionRef.current;
     const aMode=arpModeRef.current;
     const lb=lastBassRef.current;
-    const result=buildSection(genre,sectionName||currentSectionName,mName,prog,aMode,lb);
+    const result=buildSection(genre,sectionName||currentSectionName,mName,prog,aMode,lb,compositionRef.current,compositionCycleRef.current);
+    compositionCycleRef.current+=1;
     if(pushUndo_)pushUndo();
     setPatterns(result.patterns);
     setBassLine(result.bassLine);
@@ -1073,6 +1213,8 @@ export default function App(){
     const pp=CHORD_PROGS[mName]||CHORD_PROGS.minor;
     const prog=pick(pp);
     const aMode=pick(['up','down','updown','outside']);
+    compositionRef.current=createCompositionBlueprint(g,mName,prog,aMode);
+    compositionCycleRef.current=0;
     setGenre(g);setModeName(mName);setArpMode(aMode);
     progressionRef.current=prog;arpModeRef.current=aMode;
     setBpm(Math.round(gd.bpm[0]+rnd()*(gd.bpm[1]-gd.bpm[0])));
@@ -1082,7 +1224,8 @@ export default function App(){
     const sec=pick(Object.keys(SECTIONS));
     setCurrentSectionName(sec);
     lastBassRef.current='C2';
-    const result=buildSection(g,sec,mName,prog,aMode,'C2');
+    const result=buildSection(g,sec,mName,prog,aMode,'C2',compositionRef.current,compositionCycleRef.current);
+    compositionCycleRef.current+=1;
     setPatterns(result.patterns);setBassLine(result.bassLine);setSynthLine(result.synthLine);setLaneLen(result.laneLen);
     patternsRef.current=result.patterns;bassRef.current=result.bassLine;synthRef.current=result.synthLine;laneLenRef.current=result.laneLen;
     lastBassRef.current=result.lastBass;
@@ -1110,6 +1253,8 @@ export default function App(){
     reharmonize:()=>{
       const pp=CHORD_PROGS[modeName]||CHORD_PROGS.minor;
       progressionRef.current=pick(pp);
+      compositionRef.current=createCompositionBlueprint(genre,modeName,progressionRef.current,arpModeRef.current);
+      compositionCycleRef.current=0;
       regenerateSection(currentSectionName);
       setStatus('Reharmonized');
     },
@@ -1182,6 +1327,8 @@ export default function App(){
       const modes=['up','down','updown','outside'];
       const next=modes[(modes.indexOf(arpModeRef.current)+1)%modes.length];
       setArpMode(next);arpModeRef.current=next;
+      compositionRef.current=createCompositionBlueprint(genre,modeName,progressionRef.current,next);
+      compositionCycleRef.current=0;
       regenerateSection(currentSectionName);
       setStatus(`Arp → ${next}`);
     },
@@ -1223,14 +1370,21 @@ export default function App(){
 
   // ─── SONG ARC ─────────────────────────────────────────────────────────────
   const startSongArc=()=>{
-    const arc=pick(SONG_ARCS);
-    setSongArc(arc);arcRef.current=arc;
+    const song=buildSong(genre);
+    compositionRef.current=song.composition;
+    compositionCycleRef.current=0;
+    progressionRef.current=song.progression;
+    arpModeRef.current=song.arpeMode;
+    setModeName(song.modeName);
+    setArpMode(song.arpeMode);
+    setBpm(song.bpm);bpmRef.current=song.bpm;
+    setSongArc(song.arc);arcRef.current=song.arc;
     setArcIdx(0);arcIdxRef.current=0;
     barCountRef.current=0;
     setSongActive(true);songActiveRef.current=true;
-    setCurrentSectionName(arc[0]);
-    regenerateSection(arc[0]);
-    setStatus(`Song arc started: ${arc.join(' → ')}`);
+    setCurrentSectionName(song.arc[0]);
+    setTimeout(()=>regenerateSection(song.arc[0]),0);
+    setStatus(`Song arc started: ${song.arc.join(' → ')}`);
   };
   const stopSongArc=()=>{
     setSongActive(false);songActiveRef.current=false;
@@ -1253,7 +1407,7 @@ export default function App(){
 
   // ─── SAVE/LOAD ────────────────────────────────────────────────────────────
   const serialize=()=>({
-    v:3,genre,modeName,bpm,currentSectionName,grooveProfile,arpMode:arpModeRef.current,
+    v:3,genre,modeName,bpm,currentSectionName,grooveProfile,arpMode:arpModeRef.current,progression:progressionRef.current,
     space,tone,noiseMix,drive,compress,bassFilter,synthFilter,drumDecay,bassSubAmt,fmIdx,
     master,swing,humanize,grooveAmt,projectName,polySynth,bassStack,bassPreset,synthPreset,drumPreset,performancePreset,
     patterns,bassLine,synthLine,laneLen,
@@ -1262,8 +1416,11 @@ export default function App(){
     if(!snap||(snap.v!==2&&snap.v!==3))return;
     stopClock();
     setGenre(snap.genre||'techno');setModeName(snap.modeName||'minor');setBpm(snap.bpm||128);bpmRef.current=snap.bpm||128;
+    progressionRef.current=snap.progression||progressionRef.current;
     setCurrentSectionName(snap.currentSectionName||'groove');setGrooveProfile(snap.grooveProfile||'steady');
     setArpMode(snap.arpMode||'up');arpModeRef.current=snap.arpMode||'up';
+    compositionRef.current=createCompositionBlueprint(snap.genre||'techno',snap.modeName||'minor',progressionRef.current,arpModeRef.current);
+    compositionCycleRef.current=0;
     setSpace(snap.space??0.3);setTone(snap.tone??0.7);setNoiseMix(snap.noiseMix??0.2);setDrive(snap.drive??0.1);
     setCompress(snap.compress??0.3);setBassFilter(snap.bassFilter??0.55);setSynthFilter(snap.synthFilter??0.65);
     setDrumDecay(snap.drumDecay??0.5);setBassSubAmt(snap.bassSubAmt??0.5);setFmIdx(snap.fmIdx??0.6);
