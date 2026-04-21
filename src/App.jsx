@@ -407,6 +407,59 @@ function chooseLength(sectionName, lane, lenBias, localStep, energy){
   return Math.min(8,Math.max(0.5,lenBias*(anchor?1.9:1.05+energy*0.5)));
 }
 
+function noteIndexSafe(pool,note){
+  const idx=pool.indexOf(note);
+  return idx===-1?0:idx;
+}
+
+function nearestPoolNote(target,pool,prefer=[]) {
+  const source=[...new Set([...(prefer||[]).filter(Boolean),...(pool||[]).filter(Boolean)])];
+  if(!source.length)return target||'C4';
+  const targetIdx=noteIndexSafe(pool,target||source[0]);
+  return source.reduce((best,n)=>{
+    const d=Math.abs(noteIndexSafe(pool,n)-targetIdx);
+    const bd=Math.abs(noteIndexSafe(pool,best)-targetIdx);
+    return d<bd?n:best;
+  },source[0]);
+}
+
+function classifyChordFunction(chord,pool){
+  const root=chord?.r ?? 0;
+  const degree=((root%7)+7)%7;
+  if(degree===0)return 'tonic';
+  if(degree===4||degree===6)return 'dominant';
+  if(degree===3||degree===1)return 'predominant';
+  return 'color';
+}
+
+function chooseTargetTone(chordPool,pool,lane,sectionName,functionType,energy,previous){
+  const triad=(chordPool&&chordPool.length)?chordPool:[pool[0]];
+  const root=triad[0]||pool[0];
+  const third=triad[1]||root;
+  const fifth=triad[2]||third;
+  const choices = lane==='bass'
+    ? (functionType==='dominant'?[root,fifth,root] : functionType==='predominant'?[root,third,root] : [root,root,fifth])
+    : (functionType==='dominant'?[third,fifth,third,root] : functionType==='predominant'?[third,root,fifth,third] : [root,third,fifth,third]);
+  const preferred=choices.filter(Boolean);
+  const resolved=nearestPoolNote(previous||preferred[0], pool, preferred);
+  if(sectionName==='break'&&lane==='synth'&&rnd()<0.45)return nearestPoolNote(third,pool,[third,fifth]);
+  if(sectionName==='drop'&&energy>0.8&&lane==='synth'&&rnd()<0.35)return nearestPoolNote(fifth,pool,[fifth,third]);
+  if(rnd()<0.62)return resolved;
+  return preferred[Math.floor(rnd()*preferred.length)]||resolved;
+}
+
+function choosePassingTone(current,target,pool,lane,energy){
+  if(!current||!target)return target||current||pool[0];
+  const ci=noteIndexSafe(pool,current), ti=noteIndexSafe(pool,target);
+  const diff=ti-ci;
+  if(Math.abs(diff)<=1)return target;
+  const step=diff>0?1:-1;
+  const leapBias=lane==='bass'?0.26:0.18;
+  if(rnd()<clamp(leapBias-energy*0.1,0.08,0.28))return target;
+  const mid=pool[clamp(ci+step,0,pool.length-1)]||target;
+  return rnd()<0.18 && Math.abs(diff)>2 ? (pool[clamp(ci+step*2,0,pool.length-1)]||mid) : mid;
+}
+
 // ─── MELODIC PHRASE BUILDER ───────────────────────────────────────────────────
 // Creates motif/reply phrases with recall, section energy and controlled mutation
 function buildMelodicLine(pool, chordProgression, steps, chaos, arpeMode, lenBias, options={}){
@@ -466,23 +519,40 @@ function buildMelodicLine(pool, chordProgression, steps, chaos, arpeMode, lenBia
       const motifNote=phraseMotif[motifSlot];
       const anchor=local%8===0;
 
+      const functionType=classifyChordFunction(chordProgression[chordIndex],pool);
+      const prevNote=line[Math.max(0,abs-1)]||current||pool[0];
       let note=motifNote;
-      if(note===null&&on&&lane==='bass')note=chordPool[0]||pool[0];
-      if(note===null&&on&&lane==='synth')note=arp(chordPool.length?chordPool:pool,arpeMode,local+cycleIndex);
-
-      if(note!==null){
-        const nearest=(chordPool.length?chordPool:pool).reduce((best,n)=>
-          Math.abs(pool.indexOf(n)-pool.indexOf(note))<Math.abs(pool.indexOf(best)-pool.indexOf(note))?n:best
-        ,(chordPool.length?chordPool:pool)[0]);
-        if(on)note=nearest;
-      }else{
-        note=line[Math.max(0,abs-1)]||pool[0];
+      if(note===null&&on){
+        note=chooseTargetTone(chordPool,pool,lane,sectionName,functionType,energy,prevNote);
+        if(lane==='synth'&&rnd()<0.22)note=nearestPoolNote(arp(chordPool.length?chordPool:pool,arpeMode,local+cycleIndex),pool,chordPool);
       }
 
-      if(anchor&&lane==='bass'&&rnd()<0.72)note=chordPool[0]||note;
-      if(anchor&&lane==='synth'&&sectionName!=='break'&&rnd()<0.4)note=arp(chordPool.length?chordPool:pool,arpeMode,phrase+local);
+      if(note!==null){
+        const preferredTargets = lane==='bass'
+          ? [chordPool[0],chordPool[2],prevNote]
+          : [chordPool[1],chordPool[0],chordPool[2],prevNote];
+        const nearest=nearestPoolNote(note,pool,preferredTargets);
+        if(on)note=nearest;
+      }else{
+        note=prevNote;
+      }
+
+      const cadencePoint = local%16===14 || local%16===15;
+      if(on && !anchor && cadencePoint && rnd()<(lane==='synth'?0.42:0.28)){
+        const targetTone=chooseTargetTone(chordPool,pool,lane,sectionName,functionType,energy,prevNote);
+        note=choosePassingTone(prevNote,targetTone,pool,lane,energy);
+      }
+      if(on && local%16===7 && lane==='synth' && rnd()<0.24){
+        const targetTone=chooseTargetTone(chordPool,pool,lane,sectionName,functionType,energy,prevNote);
+        note=choosePassingTone(prevNote,targetTone,pool,lane,energy);
+      }
+
+      if(anchor&&lane==='bass'&&rnd()<0.76)note=chooseTargetTone(chordPool,pool,lane,sectionName,functionType,energy,prevNote)||note;
+      if(anchor&&lane==='synth'&&sectionName!=='break'&&rnd()<0.36)note=chooseTargetTone(chordPool,pool,lane,sectionName,functionType,energy,prevNote)||note;
+      if(sectionName==='drop'&&lane==='bass'&&local%16===0&&rnd()<0.4)note=nearestPoolNote(chordPool[0]||note,pool,[chordPool[0],chordPool[2]]);
 
       line[abs]=note;
+      current=note||current;
       lengths[abs]=chooseLength(sectionName,lane,lenBias,local,energy);
       if(on&&local%16===15&&sectionName!=='fill'&&rnd()<0.38)lengths[abs]=Math.min(8,lengths[abs]+1.5);
     }
@@ -1134,16 +1204,21 @@ export default function App(){
     const energy=compositionEnergyRef.current;
     const snareTone=clamp((drumPresetCfg.snareTone??0.6)+charCfg.toneBias*0.45+(variation.toneShift||0)+(variation.variantBias||0)+energy*0.03,0.18,1);
     const nb=noiseBuffer(0.16+drumDecay*0.08+Math.max(-0.03,(variation.decayShift||0)*0.04),0.18+noiseMix*0.46+(variation.ghost?0.03:0),gd.noiseColor||'white');
-    const src=a.ctx.createBufferSource(),fil=a.ctx.createBiquadFilter(),bp=a.ctx.createBiquadFilter(),g=a.ctx.createGain();
+    const src=a.ctx.createBufferSource(),fil=a.ctx.createBiquadFilter(),bp=a.ctx.createBiquadFilter(),snap=a.ctx.createBiquadFilter(),g=a.ctx.createGain();
     const osc=a.ctx.createOscillator(),og=a.ctx.createGain();
-    src.buffer=nb;fil.type='bandpass';fil.frequency.value=1200+snareTone*1400+noiseMix*300;fil.Q.value=0.8+compress*0.5+(variation.variant?0.25:0);
+    const snapNoise=a.ctx.createBufferSource(),snapG=a.ctx.createGain();
+    const snapBuf=noiseBuffer(0.018+noiseMix*0.01,0.46,'white');
+    src.buffer=nb; snapNoise.buffer=snapBuf;
+    fil.type='bandpass';fil.frequency.value=1200+snareTone*1400+noiseMix*300;fil.Q.value=0.8+compress*0.5+(variation.variant?0.25:0);
     bp.type='highpass';bp.frequency.value=clamp(180+snareTone*260,120,520);
+    snap.type='bandpass';snap.frequency.value=clamp(2400+snareTone*1800+(variation.variant?320:0),1800,5200);snap.Q.value=1.1+(variation.ghost?0.2:0.5);
     osc.type=snareTone>0.64?'triangle':'sine';osc.frequency.value=clamp(150+snareTone*110,140,320);
     og.gain.setValueAtTime(0,t);og.gain.linearRampToValueAtTime((0.06+snareTone*0.2)*(variation.ghost?0.55:1)*accent,t+0.001);og.gain.exponentialRampToValueAtTime(0.001,t+0.045+drumDecay*0.08);
+    snapG.gain.setValueAtTime(0,t);snapG.gain.linearRampToValueAtTime((0.08+snareTone*0.12+energy*0.04)*(variation.ghost?0.4:1)*accent,t+0.0007);snapG.gain.exponentialRampToValueAtTime(0.001,t+0.022+drumDecay*0.02);
     g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime((0.34+snareTone*0.24)*(variation.ghost?0.52:1)*accent,t+0.002);g.gain.exponentialRampToValueAtTime(0.001,t+0.05+drumDecay*0.13);
-    src.connect(fil);fil.connect(bp);bp.connect(g);osc.connect(og);og.connect(g);
+    src.connect(fil);fil.connect(bp);bp.connect(g);osc.connect(og);og.connect(g);snapNoise.connect(snap);snap.connect(snapG);snapG.connect(g);
     const dest=getLaneGain('snare')||a.bus;g.connect(dest);
-    gc(src,[fil,bp,g,osc,og],500);ss(src,t);ss(osc,t);st(src,t+0.2);st(osc,t+0.08+drumDecay*0.06);
+    gc(src,[fil,bp,snap,g,osc,og,snapNoise,snapG],520);ss(src,t);ss(osc,t);ss(snapNoise,t);st(src,t+0.2);st(osc,t+0.08+drumDecay*0.06);st(snapNoise,t+0.03);
   };
 
   const playHat=(accent,t,open=false,variation={})=>{
@@ -1153,13 +1228,14 @@ export default function App(){
     const energy=compositionEnergyRef.current;
     const hatTone=clamp((drumPresetCfg.hatTone??0.8)+charCfg.toneBias*0.55+(variation.toneShift||0)+(variation.variantBias||0)+energy*0.02,0.22,1);
     const nb=noiseBuffer(open?0.26+drumDecay*0.08+Math.max(-0.02,(variation.decayShift||0)*0.04):0.08+drumDecay*0.04+Math.max(-0.01,(variation.decayShift||0)*0.015),0.14+noiseMix*0.32+(variation.variant?0.02:0),gd.noiseColor||'white');
-    const src=a.ctx.createBufferSource(),hp=a.ctx.createBiquadFilter(),bp=a.ctx.createBiquadFilter(),g=a.ctx.createGain();
+    const src=a.ctx.createBufferSource(),hp=a.ctx.createBiquadFilter(),bp=a.ctx.createBiquadFilter(),air=a.ctx.createBiquadFilter(),g=a.ctx.createGain();
     src.buffer=nb;hp.type='highpass';hp.frequency.value=open?clamp(5200+hatTone*2200,4200,9200):clamp(6800+hatTone*2400,5800,12000);
     bp.type='bandpass';bp.frequency.value=open?clamp(7600+hatTone*2600+(variation.variant?260:-120),6200,12000):clamp(9000+hatTone*2200+(variation.variant?-320:180),7600,14000);bp.Q.value=open?(variation.variant?0.75:0.9):(variation.variant?1.1:1.4);
+    air.type='highshelf';air.frequency.value=clamp(7000+hatTone*3200,6200,15000);air.gain.value=variation.variant?2.8:1.8+energy*1.2;
     const decay=open?0.05+drumDecay*0.22+hatTone*0.02:0.006+drumDecay*0.032+(1-hatTone)*0.01;
     g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime((0.18+hatTone*0.18)*accent,t+0.0009);g.gain.exponentialRampToValueAtTime(0.001,t+decay);
-    src.connect(hp);hp.connect(bp);bp.connect(g);const dest=getLaneGain('hat')||a.bus;g.connect(dest);
-    gc(src,[hp,bp,g],650);ss(src,t);st(src,t+(open?0.35:0.15));
+    src.connect(hp);hp.connect(bp);bp.connect(air);air.connect(g);const dest=getLaneGain('hat')||a.bus;g.connect(dest);
+    gc(src,[hp,bp,air,g],650);ss(src,t);st(src,t+(open?0.35:0.15));
   };
 
 
@@ -1189,9 +1265,9 @@ export default function App(){
     const charCfg=getCharacterConfig(soundCharacterRef.current);
     const energy=compositionEnergyRef.current;
     const g=a.ctx.createGain(),fil=a.ctx.createBiquadFilter();
-    fil.type='lowpass';fil.frequency.setValueAtTime(60+(bassFilter+charCfg.bassFilterBias)*3000+(tone+charCfg.toneBias)*500+bassPresetCfg.bassPunch*500+energy*180,t);fil.Q.value=0.45+compress*2.6+bassPresetCfg.bassMotion*1.2+energy*0.35;
+    fil.type='lowpass';fil.frequency.setValueAtTime(60+(bassFilter+charCfg.bassFilterBias)*3000+(tone+charCfg.toneBias)*500+bassPresetCfg.bassPunch*500+energy*180,t);fil.frequency.linearRampToValueAtTime(clamp(110+(bassFilter+charCfg.bassFilterBias)*3600+(bassPresetCfg.bassMotion*540)+(tone+charCfg.toneBias)*380+energy*260,90,4200),t+Math.min(0.16,dur*0.34));fil.Q.value=0.45+compress*2.6+bassPresetCfg.bassMotion*1.2+energy*0.35;
     const bassPeak=0.46+bassPresetCfg.bassPunch*0.22;
-    g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(bassPeak*accent,t+atk);g.gain.setValueAtTime(bassPeak*accent,t+rel*(0.22+bassPresetCfg.bassPunch*0.18));g.gain.exponentialRampToValueAtTime(0.0001,t+rel);
+    g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(bassPeak*accent,t+atk);g.gain.setValueAtTime(bassPeak*accent,t+rel*(0.22+bassPresetCfg.bassPunch*0.18));g.gain.linearRampToValueAtTime((0.18+bassPresetCfg.bassPunch*0.08)*accent,t+rel*(0.56+bassPresetCfg.bassMotion*0.08));g.gain.exponentialRampToValueAtTime(0.0001,t+rel);
     const cleanMs=(rel+0.3)*1000;
 
     if(mode==='fm'||mode==='bit'){
@@ -1345,9 +1421,10 @@ export default function App(){
     amp.gain.setValueAtTime((0.28+synthPunch*0.18)*accent,t+Math.max(atk+0.01,dur*(0.58+synthMotion*0.14)));
     amp.gain.exponentialRampToValueAtTime(0.001,t+rel);
     const mix=a.ctx.createGain();mix.gain.value=0.5;
-    o1.connect(mix);o2.connect(mix);mix.connect(fil);fil.connect(amp);
+    const sheen=a.ctx.createBiquadFilter();sheen.type='highshelf';sheen.frequency.value=clamp(2600+(tone+charCfg.toneBias)*1800+synthMotion*900,1800,7200);sheen.gain.value=clamp((synthPunch-0.45)*6+energy*2.4,-2,5.5);
+    o1.connect(mix);o2.connect(mix);mix.connect(fil);fil.connect(sheen);sheen.connect(amp);
     const dest=getLaneGain('synth')||a.bus;amp.connect(dest);trackNode(cleanMs);
-    gc(o1,[o2,vib,vg,mix,fil,amp],cleanMs);
+    gc(o1,[o2,vib,vg,mix,fil,sheen,amp],cleanMs);
     ss(o1,t);ss(o2,t);ss(vib,t);st(o1,t+rel+0.1);st(o2,t+rel+0.1);st(vib,t+rel+0.1);
     if(midiRef.current){const out=[...midiRef.current.outputs.values()][0];if(out){const v=Math.round(clamp(accent,0,1)*127);out.send([0x94,NOTE_MIDI[note]||60,v]);setTimeout(()=>out.send([0x84,NOTE_MIDI[note]||60,0]),rel*1000);}}
   };
